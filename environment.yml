@@ -1,0 +1,21 @@
+name: mingpt
+channels:
+  - pytorch
+  - defaults
+  - nvidia
+  - conda-forge
+dependencies:
+  - ipykernel
+  - ipywidgets
+  - python>=3.9.1
+  - pip
+  - tqdm
+  - pip:
+    - --find-links https://download.pytorch.org/whl/torch_stable.html
+    - --find-links https://storage.googleapis.com/jax-releases/jax_releases.html
+    - jax
+    - jaxlib==0.1.67+cuda111
+    - torch==1.9.0+cu111
+    - torchvision
+    - dm-haiku
+    - optax
