@@ -13,6 +13,7 @@ from jax.experimental import optimizers
 import optax
 from optax import chain, clip_by_global_norm, scale_by_adam, scale, scale_by_schedule, add_decayed_weights
 from jax import local_device_count
+from jax.experimental.maps import xmap, mesh
 
 from tqdm import tqdm
 import math
@@ -95,17 +96,9 @@ def configure_decay_mask(params):
     assert all([decays >= 0 for decays in jax.tree_flatten(mask)[0]])
     return jax.tree_map(lambda x: x == 1, mask)
 
-def pmap_batch(batch):
-    """Splits the first axis of `arr` evenly across the number of devices."""
+def trim_batch(batch):
     per_device_batch_size = batch.shape[0] // local_device_count()
-    batch = batch[:per_device_batch_size * local_device_count()] # trim the rest of the batch
-    return batch.reshape(local_device_count(), per_device_batch_size, *batch.shape[1:])
-
-def pmap_on(tree):
-    return jax.tree_map(lambda x: jnp.array([x] * local_device_count()), tree)
-
-def pmap_off(tree):
-    return jax.device_get(jax.tree_map(lambda x: x[0], tree))
+    return batch[:per_device_batch_size * local_device_count()]
 
 class Trainer:
     def __init__(self, hk_loss_fn, train_dataset, test_dataset, config):
@@ -117,15 +110,15 @@ class Trainer:
     def save_checkpoint(self, params, opt_state):
         if self.config.ckpt_path is None: return
         logger.info("saving to %s", self.config.ckpt_path )
-        pickle.dump(pmap_off(params), open(self.config.ckpt_path + '/model.npy', "wb"))
-        pickle.dump(pmap_off(opt_state), open(self.config.ckpt_path + '/optimizer.npy', "wb"))
+        pickle.dump(params, open(self.config.ckpt_path + '/model.npy', "wb"))
+        pickle.dump(opt_state, open(self.config.ckpt_path + '/optimizer.npy', "wb"))
     
     def init_params(self):
         self.config.rng, subkey = jax.random.split(self.config.rng)
         train_dl = DataLoader(self.train_dataset, batch_size=self.config.batch_size, num_workers=self.config.num_workers)
         batch = next(iter(train_dl))
         xs, ys = map(jnp.array, batch)
-        params = self.hk_loss_fn.init(subkey, xs, ys)
+        params = self.hk_loss_fn.init(subkey, xs[0], ys[0])
         logger.info("number of parameters: %d", sum([leave.size for leave in jax.tree_leaves(params)]))
         return params
             
@@ -142,24 +135,24 @@ class Trainer:
         )
         if opt_state is None:
             opt_state = optimiser.init(params)
-        params, opt_state = map(pmap_on, (params, opt_state))
         loss_fn = self.hk_loss_fn.apply
-            
-        @partial(jax.pmap, axis_name='num_devices')
+        
+        devices = jax.devices()        
+        @partial(xmap, in_axes=[[...], [...], ['batch', ...], ['batch', ...], [...]], out_axes=[...], axis_resources={'batch': 'b'})
         def update(params, subkey, x, y, opt_state):
             loss, grads = jax.value_and_grad(loss_fn)(params, subkey, x, y)
             
-            grads = jax.lax.pmean(grads, axis_name='num_devices')
-            loss = jax.lax.pmean(loss, axis_name='num_devices')
+            grads = jax.lax.pmean(grads, axis_name='batch')
+            loss = jax.lax.pmean(loss, axis_name='batch')
             
             updates, opt_state = optimiser.update(grads, opt_state, params)
             params = optax.apply_updates(params, updates)
             return loss, params, opt_state
                 
-        @partial(jax.pmap, axis_name='num_devices')
+        @partial(xmap, in_axes=[[...], [...], ['batch', ...], ['batch', ...]], out_axes=[...], axis_resources={'batch': 'b'})
         def get_loss(params, subkey, xs, ys):
             loss = loss_fn(params, subkey, xs, ys)
-            return jax.lax.pmean(loss, axis_name='num_devices')
+            return jax.lax.pmean(loss, axis_name='batch')
             
         def run_epoch(params, opt_state, it, split):
             is_train = split == 'train'
@@ -171,10 +164,9 @@ class Trainer:
             losses = []
             pbar = tqdm(loader) if is_train else loader
             for batch in pbar:
-                xs, ys = map(pmap_batch, map(jnp.array, batch))
+                xs, ys = map(trim_batch, map(jnp.array, batch))
                 # different rng on each device
-                config.rng, *subkey = jax.random.split(config.rng, num=local_device_count()+1)
-                subkey = jnp.array(subkey)
+                config.rng, subkey = jax.random.split(config.rng)
                 
                 # forward the model
                 if is_train:
@@ -182,7 +174,6 @@ class Trainer:
                 else:
                     loss = get_loss(params, subkey, xs, ys)
                     
-                loss = loss[0]    
                 losses.append(loss)
                 
                 if is_train:
@@ -200,9 +191,10 @@ class Trainer:
         best_loss = float('inf')
         it = 0 # counter used for learning rate decay
         for epoch in range(config.max_epochs):
-            params, opt_state, it = run_epoch(params, opt_state, it, 'train')
-            if self.test_dataset is not None:
-                test_loss = run_epoch(params, opt_state, 0, 'test')
+            with mesh(devices, ('b')): 
+                params, opt_state, it = run_epoch(params, opt_state, it, 'train')
+                if self.test_dataset is not None:
+                    test_loss = run_epoch(params, opt_state, 0, 'test')
 
             # supports early stopping based on the test loss, or just save always if no test set is provided
             good_model = self.test_dataset is None or test_loss < best_loss
@@ -210,6 +202,5 @@ class Trainer:
                 best_loss = test_loss
                 self.save_checkpoint(params, opt_state)
                 
-        params, opt_state = map(pmap_off, (params, opt_state))        
         return params, opt_state
     

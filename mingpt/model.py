@@ -128,4 +128,4 @@ def cross_entropy(logits, targets):
     return loss 
 
 def loss_fn(idx, targets, config, is_training):
-    return cross_entropy(jax.vmap(gpt, in_axes=[0, None, None])(idx, config, is_training), targets)
+    return cross_entropy(gpt(idx, config, is_training), targets)
