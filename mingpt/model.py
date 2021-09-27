@@ -32,12 +32,25 @@ class GPT1Config(GPTConfig):
 
 normal_init = hk.initializers.RandomNormal(stddev=0.02, mean=0.0)
 Linear = partial(hk.Linear, w_init=normal_init, b_init=hk.initializers.Constant(0.0))
-LayerNorm = partial(hk.LayerNorm, axis=-1, create_scale=True, create_offset=True)
+LayerNorm = partial(hk.LayerNorm, axis=-1, create_scale=True, create_offset=True, use_fast_variance=True)
 
 def Dropout(is_training):
     def dropout(pdrop, x):
         return hk.dropout(hk.next_rng_key(), pdrop, x) if is_training and pdrop>0.0 else x
     return dropout
+
+def causal_depthwise_conv(x, kernel_size=3):
+    """Causal depthwise convolution for [...,Tokens,Embeddings]"""
+
+    def scale_var(shift_distance):
+        return hk.get_parameter("conv_%s" % shift_distance, shape=x.shape[-1:], dtype=jnp.float32, 
+                            init=hk.initializers.Constant(0.5 if shift_distance == 0 else 0.5 / kernel_size))
+    ret = x * scale_var(0)
+    for shift_distance in range(1, kernel_size):
+        x = jnp.roll(x, 1, axis=-2)
+        x = x.at[...,0,:].set(0.)
+        ret += x * scale_var(shift_distance)
+    return ret
 
 def causal_self_attention(x, config, dropout):
     """
@@ -56,6 +69,8 @@ def causal_self_attention(x, config, dropout):
     k = LL(name='linear_k')(x)
     q = LL(name='linear_q')(x)
     v = LL(name='linear_v')(x)
+    k,q,v = map(causal_depthwise_conv, (k,q,v))
+    
     # nh - number of heads (n_head), hs - head size
     # (T, E=nh*hs) -> (T, nh, hs) -> (nh, T, hs)
     hs = E // config.n_head
@@ -79,14 +94,21 @@ def causal_self_attention(x, config, dropout):
     y = dropout(config.resid_pdrop, y)
     return y
 
+def squared_relu(x):
+    return jnp.square(jax.nn.relu(x))
+
+def geglu(x):
+    x, gate = jnp.split(x, 2, axis = -1)
+    return x * jax.nn.gelu(gate)
+
 def block(x, config, dropout):
     """ an unassuming Transformer block """
     ln1 = LayerNorm(name='layer_norm1')
     ln2 = LayerNorm(name='layer_norm2')
                 
     mlp = hk.Sequential([
-        Linear(4 * config.n_embd, name='linear_mlp1'),
-        jax.nn.gelu,
+        Linear(5 * config.n_embd, name='linear_mlp1'),
+        geglu, 
         Linear(config.n_embd, name='linear_mlp2'),
     ])
     x = x + causal_self_attention(ln1(x), config, dropout)
