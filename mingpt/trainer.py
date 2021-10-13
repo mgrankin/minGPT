@@ -76,7 +76,7 @@ def configure_decay_mask(params):
     tree_types = (tuple, list, dict, Mapping, type(None))
     
     def check_decay_list(key, parent_decays):
-        if any([layer in key for layer in ['embeddings', 'layer_norm', 'multi_head_attention']]): return 0
+        if any([layer in key for layer in ['gamma', 'lmbd', 'embeddings', 'layer_norm', 'multi_head_attention']]): return 0
         if key == 'b': return 0
         if 'linear' in key: return 1
         return parent_decays

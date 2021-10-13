@@ -71,6 +71,9 @@ def causal_self_attention(x, config, dropout):
     att = dropout(config.attn_pdrop, att)
     # (nh, T, T) x (nh, T, hs) -> (nh, T, hs)
     y = att @ v 
+    # NormFormer: HeadScale
+    gamma = hk.get_parameter("gamma", shape=[config.n_head,1,1], dtype=jnp.float32, init=jnp.ones)
+    y = y * gamma
     # (nh, T, hs) -> (T, nh, hs) -> (T, E) - re-assemble all head outputs
     y = y.swapaxes(0,1).reshape(T, E) 
 
@@ -83,16 +86,22 @@ def block(x, config, dropout):
     """ an unassuming Transformer block """
     ln1 = LayerNorm(name='layer_norm1')
     ln2 = LayerNorm(name='layer_norm2')
+    # NormFormer
+    ln3 = LayerNorm(name='layer_norm3')
+    ln4 = LayerNorm(name='layer_norm4')
                 
     mlp = hk.Sequential([
         Linear(4 * config.n_embd, name='linear_mlp1'),
         jax.nn.gelu,
+        ln3,
         Linear(config.n_embd, name='linear_mlp2'),
     ])
-    x = x + causal_self_attention(ln1(x), config, dropout)
+    x = x + ln4(causal_self_attention(ln1(x), config, dropout))
     mlp = mlp(ln2(x))
     mlp = dropout(config.resid_pdrop, mlp)
-    return x + mlp
+    # NormFormer: Scaled Residual Connection
+    lmbd = hk.get_parameter("lmbd", shape=[config.n_embd], dtype=jnp.float32, init=jnp.ones)
+    return x*lmbd + mlp
 
 def gpt(x, config, is_training):
     """  the full GPT language model, with a context size of block_size """
