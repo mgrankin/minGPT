@@ -7,15 +7,14 @@ channels:
 dependencies:
   - ipykernel
   - ipywidgets
-  - python>=3.9.1
+  - python<3.10
   - pip
   - tqdm
   - pip:
-    - --find-links https://download.pytorch.org/whl/torch_stable.html
+    - --find-links https://download.pytorch.org/whl/cu113/torch_stable.html
     - --find-links https://storage.googleapis.com/jax-releases/jax_releases.html
-    - jax
-    - jaxlib==0.1.69+cuda111
-    - torch==1.9.0+cu111
+    - jax[cuda]
+    - torch==1.10.0+cu113
     - torchvision
     - dm-haiku
     - optax
